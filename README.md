@@ -2,7 +2,7 @@
 
 一款 HarmonyOS 拍照水印应用：读取照片 EXIF 拍摄参数，一键生成专业风格的相机水印图。
 
-![预览](screen.jpeg)
+![预览](screen.png)
 
 ## 功能特性
 

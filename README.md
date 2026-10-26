@@ -1,4 +1,4 @@
-# 银痕 Yinhen
+# 印痕 Yinhen
 
 一款 HarmonyOS 拍照水印应用：读取照片 EXIF 拍摄参数，一键生成专业风格的相机水印图。
 

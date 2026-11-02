@@ -41,6 +41,9 @@ export class PhotoItem {
   uri: string = '';
   exif: ExifInfo = new ExifInfo();
   exifLoaded: boolean = false;
+  // EXIF 解析器原生输出快照（成就判定唯一可信来源，手动输入/默认值回填不影响它）
+  nativeExif: ExifInfo = new ExifInfo();
+  nativeLoaded: boolean = false;
 
   constructor(uri: string) {
     this.uri = uri;

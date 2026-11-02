@@ -1,6 +1,19 @@
 {
   app: {
     signingConfigs: [
+      {
+        name: 'default',
+        type: 'HarmonyOS',
+        material: {
+          certpath: 'C:\\Users\\11949\\.ohos\\config\\default_yinhen_Khjq9ayLffYshof6ArUpOql2pkCkbaCSJWTs0c3hpQ=.cer',
+          keyAlias: 'debugKey',
+          keyPassword: '0000001b7a1c5f1a9fa988ea0726bb738e6a7d6221b9d1c07e9ac63cdf39c8d7083e7fc0b8a1eb9487d214',
+          profile: 'C:\\Users\\11949\\.ohos\\config\\default_yinhen_Khjq9ayLffYshof6ArUpOql2pkCkbaCSJWTs0c3hpQ=.p7b',
+          signAlg: 'SHA256withECDSA',
+          storeFile: 'C:\\Users\\11949\\.ohos\\config\\default_yinhen_Khjq9ayLffYshof6ArUpOql2pkCkbaCSJWTs0c3hpQ=.p12',
+          storePassword: '0000001b7a1c5f1a9fa988ea0726bb738e6a7d6221b9d1c07e9ac63cdf39c8d7083e7fc0b8a1eb9487d214',
+        },
+      },
     ],
     products: [
       {
@@ -14,6 +27,7 @@
             useNormalizedOHMUrl: true,
           },
         },
+        signingConfig: 'default',
       },
     ],
     buildModeSet: [

@@ -1,5 +1,5 @@
 import { image } from '@kit.ImageKit';
-import { display, window, router, uiMaterial, componentSnapshot } from '@kit.ArkUI';
+import { display, window, router, uiMaterial, componentSnapshot, curves } from '@kit.ArkUI';
 import {
   PhotoPickerComponent,
   PickerController,
@@ -50,11 +50,28 @@ import {
 import {
   SegmentItem,
   SegmentedControl,
+  SectionTabs,
   LabeledSlider,
   ColorSwatches,
   ToggleRow,
   FieldRow
 } from '../components/Widgets';
+import { StatsDashboard } from '../components/StatsCharts';
+import {
+  ExportRecord,
+  ProfileStats,
+  AchievementDef,
+  ACHIEVEMENTS,
+  achBadgeOf,
+  ProfileStore,
+  buildExportRecord,
+  dayStartTs,
+  isUnlocked,
+  unlockTs,
+  unlockedCount,
+  topEntries,
+  NameCount
+} from '../model/ProfileModels';
 
 const BIT_MAKE: number = 1;
 const BIT_MODEL: number = 2;
@@ -70,6 +87,13 @@ const BIT_SIGN: number = 1024;
 const DEFAULT_MASK: number = 255;
 const PAR_TAG_FACTOR: number = 0.8;
 const CONTACT_EMAIL: string = '1194942391@qq.com';
+
+// 成就墙分组（彩蛋 → 金 → 银 → 铜）
+class AchGroup {
+  title: string = '';
+  defs: AchievementDef[] = [];
+  unlocked: number = 0;
+}
 
 @CustomDialog
 struct AboutDialog {
@@ -135,6 +159,55 @@ struct AboutDialog {
   }
 }
 
+@CustomDialog
+struct AchievementDetailDialog {
+  controller?: CustomDialogController;
+  def: AchievementDef = new AchievementDef();
+  unlocked: boolean = false;
+  unlockTime: string = '';
+  progressText: string = '';
+
+  build() {
+    Column({ space: 12 }) {
+      if (this.unlocked || !this.def.hidden) {
+        Image(achBadgeOf(this.def.key))
+          .width(72)
+          .height(72)
+          .opacity(this.unlocked ? 1 : 0.4)
+      } else {
+        Image($r('app.media.badge_hidden'))
+          .width(72)
+          .height(72)
+      }
+      Text(this.unlocked || !this.def.hidden ? this.def.name : '???')
+        .fontSize(17)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_main'))
+      Text(this.unlocked ? this.def.desc : (this.def.hidden ? '隐藏成就，继续探索吧' : this.def.desc))
+        .fontSize(13)
+        .fontColor($r('app.color.text_sub'))
+        .textAlign(TextAlign.Center)
+        .lineHeight(20)
+      Text(this.unlocked ? `解锁于 ${this.unlockTime}` :
+        (this.progressText === '' ? '继续加油' : `进度 ${this.progressText}`))
+        .fontSize(12)
+        .fontColor($r('app.color.accent'))
+      Text('关闭')
+        .fontSize(14)
+        .fontColor($r('app.color.text_hint'))
+        .padding({ left: 20, right: 20, top: 6, bottom: 6 })
+        .onClick(() => {
+          this.controller?.close();
+        })
+    }
+    .width(280)
+    .padding(24)
+    .borderRadius(20)
+    .backgroundColor($r('app.color.card_bg'))
+    .alignItems(HorizontalAlign.Center)
+  }
+}
+
 @Entry
 @Component
 struct Index {
@@ -164,6 +237,16 @@ struct Index {
   @State exportPng: boolean = false;
   @State activeTab: number = 0;
   @State saving: boolean = false;
+  // 风格画像：本地聚合统计 + 成就解锁弹窗队列
+  @State profileStats: ProfileStats = new ProfileStats();
+  @State achToastShow: boolean = false;
+  @State achToastDefs: AchievementDef[] = [];
+  // 版式页内分段：0=排版 1=边框
+  @State layoutSection: number = 0;
+  // 我的页内分段：0=统计 1=成就墙 2=设置
+  @State mineSection: number = 0;
+  private achQueue: AchievementDef[][] = [];
+  private achToastTimer: number = -1;
   private panelScroller: Scroller = new Scroller();
   @State statusBarH: number = 0;
   @State navBarH: number = 0;
@@ -261,10 +344,20 @@ struct Index {
   private tabItems: SegmentItem[] = [
     new SegmentItem('样式', 0),
     new SegmentItem('参数', 1),
-    new SegmentItem('排版', 2),
-    new SegmentItem('边框', 3),
-    new SegmentItem('导出', 4),
-    new SegmentItem('设置', 5)
+    new SegmentItem('版式', 2),
+    new SegmentItem('导出', 3),
+    new SegmentItem('我的', 4)
+  ];
+  // 版式页分段：0=排版 1=边框
+  private layoutSectionItems: SegmentItem[] = [
+    new SegmentItem('排版', 0),
+    new SegmentItem('边框', 1)
+  ];
+  // 我的页分段：0=统计 1=成就墙 2=设置
+  private mineSectionItems: SegmentItem[] = [
+    new SegmentItem('统计', 0),
+    new SegmentItem('成就墙', 1),
+    new SegmentItem('设置', 2)
   ];
   private skinItems: SegmentItem[] = [
     new SegmentItem('深色', 0),
@@ -368,9 +461,19 @@ struct Index {
     this.hoverPickerOptions.maxSelectedReminderMode = ReminderMode.TOAST;
     this.loadSettings();
     this.refreshCacheSize();
+    const profileCtx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    ProfileStore.load(profileCtx).then((s: ProfileStats) => {
+      this.profileStats = s;
+    }).catch((err: Object) => {
+      Logger.error(`profile load failed: ${JSON.stringify(err)}`);
+    });
   }
 
   aboutToDisappear(): void {
+    if (this.achToastTimer >= 0) {
+      clearTimeout(this.achToastTimer);
+      this.achToastTimer = -1;
+    }
     try {
       display.off('foldStatusChange', this.foldStatusCb);
       display.off('change', this.displayChangeCb);
@@ -1488,6 +1591,9 @@ struct Index {
       }
       item.exif = e;
       item.exifLoaded = true;
+      // 原生快照：仅解析器输出（清洗后的 Make/Model/LensModel），手动编辑不会触碰它
+      item.nativeExif = e.clone();
+      item.nativeLoaded = true;
     }
     fillExifGaps(item.exif, this.manualDefaults);
     this.exif = item.exif.clone();
@@ -1785,7 +1891,104 @@ struct Index {
     } finally {
       pm.release();
     }
+    if (ok) {
+      await this.recordProfileExport();
+    }
     return ok;
+  }
+
+  private currentRatioLabel(): string {
+    for (const it of this.exportRatioItems) {
+      if (Math.abs(it.value - this.exportRatio) < 0.0001) {
+        return it.label;
+      }
+    }
+    return '原图';
+  }
+
+  // 导出成功后写档案记录：只读 item.nativeExif（EXIF 解析器原生输出），手动输入不参与成就判定
+  private async recordProfileExport(): Promise<void> {
+    try {
+      const item: PhotoItem | undefined = this.photoItems[this.currentIdx];
+      if (item === undefined) {
+        return;
+      }
+      const now: number = Date.now();
+      const rec: ExportRecord = buildExportRecord(item.nativeExif, this.currentRatioLabel(), now);
+      const context: common.UIAbilityContext =
+        this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const newly: AchievementDef[] = await ProfileStore.recordExport(context, this.profileStats, rec);
+      this.profileStats = this.profileStats;
+      if (newly.length > 0) {
+        this.enqueueAchievementCard(newly);
+      }
+    } catch (err) {
+      Logger.error(`profile record failed: ${JSON.stringify(err)}`);
+    }
+  }
+
+  // ===== 成就解锁弹窗队列（右上角滑入，每日最多 3 次，批量合并一张卡）=====
+
+  private enqueueAchievementCard(defs: AchievementDef[]): void {
+    this.achQueue.push(defs);
+    this.pumpAchQueue();
+  }
+
+  private pumpAchQueue(): void {
+    if (this.achToastShow || this.achQueue.length === 0) {
+      return;
+    }
+    const defs: AchievementDef[] = this.achQueue.shift() ?? [];
+    if (defs.length === 0) {
+      this.pumpAchQueue();
+      return;
+    }
+    if (!this.tryConsumeAchPopup()) {
+      this.pumpAchQueue();
+      return;
+    }
+    this.achToastDefs = defs;
+    setTimeout(() => {
+      this.achToastShow = true;
+      this.scheduleAchToastHide();
+    }, 500);
+  }
+
+  private tryConsumeAchPopup(): boolean {
+    const s: ProfileStats = this.profileStats;
+    const today: number = dayStartTs(Date.now());
+    if (s.popupDayTs !== today) {
+      s.popupDayTs = today;
+      s.popupCountToday = 0;
+    }
+    if (s.popupCountToday >= 3) {
+      return false;
+    }
+    s.popupCountToday++;
+    const context: common.UIAbilityContext =
+      this.getUIContext().getHostContext() as common.UIAbilityContext;
+    ProfileStore.save(context, s);
+    return true;
+  }
+
+  private scheduleAchToastHide(): void {
+    if (this.achToastTimer >= 0) {
+      clearTimeout(this.achToastTimer);
+    }
+    this.achToastTimer = setTimeout(() => {
+      this.dismissAchToast();
+    }, 3000);
+  }
+
+  private dismissAchToast(): void {
+    this.achToastShow = false;
+    if (this.achToastTimer >= 0) {
+      clearTimeout(this.achToastTimer);
+      this.achToastTimer = -1;
+    }
+    setTimeout(() => {
+      this.pumpAchQueue();
+    }, 350);
   }
 
   private async doSave(): Promise<void> {
@@ -3251,6 +3454,507 @@ struct Index {
     .width('100%')
   }
 
+  // ===== 我的（摄影档案 + 成就墙 + 设置）=====
+
+  @Builder
+  mineTab() {
+    Column({ space: 14 }) {
+      // 我的页三段切换（页签级下划线式）：统计 | 成就墙 | 设置
+      SectionTabs({
+        items: this.mineSectionItems,
+        selected: this.mineSection,
+        onPick: (v: number) => {
+          this.mineSection = v;
+          if (v === 2) {
+            this.refreshCacheSize();
+          }
+        }
+      })
+      if (this.mineSection === 2) {
+        this.settingsTab()
+      } else if (this.profileStats.totalExports === 0) {
+        Column({ space: 16 }) {
+          Text('📷')
+            .fontSize(44)
+          Text('还没有记录——去导出第一张照片，你的摄影档案会从这里开始。')
+            .fontSize(14)
+            .fontColor($r('app.color.text_sub'))
+            .textAlign(TextAlign.Center)
+            .lineHeight(22)
+          Text('去导出')
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Color.White)
+            .backgroundColor($r('app.color.accent'))
+            .borderRadius(20)
+            .padding({ left: 28, right: 28, top: 10, bottom: 10 })
+            .onClick(() => {
+              this.activeTab = 3;
+            })
+        }
+        .width('100%')
+        .padding({ top: 48, bottom: 48, left: 24, right: 24 })
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+      } else {
+        this.profileHeaderCard()
+        if (this.mineSection === 0) {
+          // 维度数据看板：焦段/光圈/快门/ISO/时段/画幅（进入时算一次，Tab 切换只重绘）
+          StatsDashboard({ stats: this.profileStats })
+          this.profileGearCards()
+        } else {
+          this.achievementWall()
+        }
+      }
+    }
+    .width('100%')
+  }
+
+  // ===== 版式（排版 + 边框）=====
+
+  @Builder
+  layoutTab() {
+    Column({ space: 14 }) {
+      // 版式页两段切换（页签级下划线式）：排版 | 边框
+      SectionTabs({
+        items: this.layoutSectionItems,
+        selected: this.layoutSection,
+        onPick: (v: number) => {
+          this.layoutSection = v;
+        }
+      })
+      if (this.layoutSection === 0) {
+        this.styleTab()
+      } else {
+        this.frameTab()
+      }
+    }
+    .width('100%')
+  }
+
+  private profileStartDate(): string {
+    const d: Date = new Date(this.profileStats.firstExportTs);
+    return `${d.getMonth() + 1}月${d.getDate()}日`;
+  }
+
+  @Builder
+  profileHeaderCard() {
+    Column({ space: 6 }) {
+      Row({ space: 8 }) {
+        Text('我的摄影档案')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_main'))
+        Blank()
+        Text(`已解锁 ${unlockedCount(this.profileStats)}/${ACHIEVEMENTS.length}`)
+          .fontSize(12)
+          .fontColor($r('app.color.accent'))
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .backgroundColor($r('app.color.chip_bg'))
+          .borderRadius(12)
+          .onClick(() => {
+            this.mineSection = 1;
+          })
+      }
+      .width('100%')
+      Text(`累计 ${this.profileStats.totalExports} 张 · 从 ${this.profileStartDate()} 开始`)
+        .fontSize(12)
+        .fontColor($r('app.color.text_hint'))
+      Text(`连续记录 ${this.profileStats.streakDays} 天`)
+        .fontSize(12)
+        .fontColor($r('app.color.text_sub'))
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  profileGearCards() {
+    Column({ space: 12 }) {
+      Column({ space: 10 }) {
+        Text('相机 TOP3')
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_main'))
+          .width('100%')
+        this.profileTopList(topEntries(this.profileStats.cameraCounts, 3))
+      }
+      .width('100%')
+      .padding(14)
+      .borderRadius(12)
+      .backgroundColor($r('app.color.field_bg'))
+
+      Column({ space: 10 }) {
+        Text('镜头 TOP3')
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.text_main'))
+          .width('100%')
+        this.profileTopList(topEntries(this.profileStats.lensCounts, 3))
+      }
+      .width('100%')
+      .padding(14)
+      .borderRadius(12)
+      .backgroundColor($r('app.color.field_bg'))
+    }
+    .width('100%')
+  }
+
+  @Builder
+  profileTopList(entries: NameCount[]) {
+    Column({ space: 8 }) {
+      if (entries.length === 0) {
+        Text('暂无数据')
+          .fontSize(12)
+          .fontColor($r('app.color.text_hint'))
+          .width('100%')
+      }
+      ForEach(entries, (e: NameCount, idx: number) => {
+        Row({ space: 8 }) {
+          Text(`${idx + 1}`)
+            .fontSize(11)
+            .fontColor($r('app.color.text_hint'))
+            .width(14)
+          Text(e.name)
+            .fontSize(13)
+            .fontColor($r('app.color.text_sub'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Text(`${e.count} 次`)
+            .fontSize(12)
+            .fontColor($r('app.color.accent'))
+        }
+        .width('100%')
+      }, (e: NameCount) => `${e.name}-${e.count}`)
+    }
+    .width('100%')
+  }
+
+  private achGroups(): AchGroup[] {
+    const order: string[] = ['legend', 'gold', 'silver', 'bronze'];
+    const titles: Record<string, string> = {
+      'legend': '✦ 彩蛋成就', 'gold': '★ 金色成就', 'silver': '🥈 银色成就', 'bronze': '🥉 铜色成就'
+    };
+    const groups: AchGroup[] = [];
+    for (const rarity of order) {
+      const defs: AchievementDef[] = [];
+      let unlocked: number = 0;
+      for (const d of ACHIEVEMENTS) {
+        if (d.rarity !== rarity) {
+          continue;
+        }
+        defs.push(d);
+        if (isUnlocked(this.profileStats, d.key)) {
+          unlocked++;
+        }
+      }
+      if (defs.length > 0) {
+        const g: AchGroup = new AchGroup();
+        g.title = titles[rarity];
+        g.defs = defs;
+        g.unlocked = unlocked;
+        groups.push(g);
+      }
+    }
+    return groups;
+  }
+
+  @Builder
+  achievementWall() {
+    Column({ space: 12 }) {
+      ForEach(this.achGroups(), (g: AchGroup) => {
+        Column({ space: 10 }) {
+          Row({ space: 6 }) {
+            Text(g.title)
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.text_sub'))
+            Text(`${g.unlocked}/${g.defs.length}`)
+              .fontSize(11)
+              .fontColor($r('app.color.text_hint'))
+          }
+          .width('100%')
+          Flex({ direction: FlexDirection.Row, wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+            ForEach(g.defs, (d: AchievementDef) => {
+              this.achievementBadge(d)
+            }, (d: AchievementDef) => `${d.key}-${this.isAchUnlocked(d) ? 'on' : 'off'}`)
+          }
+          .width('100%')
+        }
+        .width('100%')
+      }, (g: AchGroup) => `${g.title}-${g.unlocked}`)
+    }
+    .width('100%')
+  }
+
+  private isAchUnlocked(d: AchievementDef): boolean {
+    return isUnlocked(this.profileStats, d.key);
+  }
+
+  private achBadgeHint(d: AchievementDef): string {
+    if (this.isAchUnlocked(d)) {
+      return '已解锁';
+    }
+    if (d.hidden) {
+      return '';
+    }
+    return d.progress(this.profileStats);
+  }
+
+  @Builder
+  achievementBadge(d: AchievementDef) {
+    Column({ space: 5 }) {
+      if (this.isAchUnlocked(d)) {
+        Image(achBadgeOf(d.key))
+          .width(46)
+          .height(46)
+      } else if (d.hidden) {
+        Image($r('app.media.badge_hidden'))
+          .width(46)
+          .height(46)
+      } else {
+        Image(achBadgeOf(d.key))
+          .width(46)
+          .height(46)
+          .opacity(0.3)
+      }
+      Text(this.isAchUnlocked(d) || !d.hidden ? d.name : '???')
+        .fontSize(11)
+        .fontColor(this.isAchUnlocked(d) ? $r('app.color.text_main') : $r('app.color.text_hint'))
+        .maxLines(1)
+      Text(this.achBadgeHint(d))
+        .fontSize(9)
+        .fontColor($r('app.color.text_hint'))
+        .maxLines(1)
+    }
+    .width('31%')
+    .margin({ bottom: 8 })
+    .onClick(() => {
+      this.openAchDetail(d);
+    })
+  }
+
+  private formatAchTime(ts: number): string {
+    const d: Date = new Date(ts);
+    const hh: string = d.getHours() < 10 ? `0${d.getHours()}` : `${d.getHours()}`;
+    const mm: string = d.getMinutes() < 10 ? `0${d.getMinutes()}` : `${d.getMinutes()}`;
+    return `${d.getFullYear()}.${d.getMonth() + 1}.${d.getDate()} ${hh}:${mm}`;
+  }
+
+  private achDetailDlg: CustomDialogController | undefined = undefined;
+
+  private openAchDetail(d: AchievementDef): void {
+    const s: ProfileStats = this.profileStats;
+    const unlocked: boolean = isUnlocked(s, d.key);
+    this.achDetailDlg = new CustomDialogController({
+      builder: AchievementDetailDialog({
+        def: d,
+        unlocked: unlocked,
+        unlockTime: unlocked ? this.formatAchTime(unlockTs(s, d.key)) : '',
+        progressText: d.hidden ? '' : d.progress(s)
+      }),
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      customStyle: true
+    });
+    this.achDetailDlg.open();
+  }
+
+  // ===== 成就解锁居中弹窗 =====
+
+  private achRarityRank(r: string): number {
+    if (r === 'legend') {
+      return 3;
+    }
+    if (r === 'gold') {
+      return 2;
+    }
+    if (r === 'silver') {
+      return 1;
+    }
+    return 0;
+  }
+
+  // 多成就合并展示时挑稀有度最高的当主展示
+  private achToastMain(): AchievementDef {
+    if (this.achToastDefs.length === 0) {
+      return new AchievementDef();
+    }
+    let main: AchievementDef = this.achToastDefs[0];
+    for (const d of this.achToastDefs) {
+      if (this.achRarityRank(d.rarity) > this.achRarityRank(main.rarity)) {
+        main = d;
+      }
+    }
+    return main;
+  }
+
+  private achToastHasLegend(): boolean {
+    for (const d of this.achToastDefs) {
+      if (d.rarity === 'legend') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private achToastHasGold(): boolean {
+    for (const d of this.achToastDefs) {
+      if (d.rarity === 'gold' || d.rarity === 'legend') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private achToastTitle(): string {
+    const main: AchievementDef = this.achToastMain();
+    if (this.achToastDefs.length > 1) {
+      return `${main.name} 等 ${this.achToastDefs.length} 个成就`;
+    }
+    return main.name;
+  }
+
+  private achToastSubtitle(): string {
+    if (this.achToastDefs.length > 1) {
+      return `本次共解锁 ${this.achToastDefs.length} 个成就`;
+    }
+    return this.achToastMain().desc;
+  }
+
+  @Builder
+  achievementToastCard() {
+    // 外层渐变只作 1.5vp 描边光环；竖排布局类似「关于」弹窗，不使用百分比高度
+    Column() {
+      Column({ space: 14 }) {
+        // 主徽章：稀有度渐变描环
+        Stack() {
+          Column()
+            .width(64)
+            .height(64)
+            .borderRadius(32)
+            .linearGradient(this.achToastHasLegend() ? {
+              angle: 135,
+              colors: [['#FF6B6B', 0], ['#FFD93D', 0.25], ['#6BCB77', 0.5], ['#4D96FF', 0.75], ['#B983FF', 1]]
+            } : {
+              angle: 135,
+              colors: this.achToastHasGold() ? [['#FFE9A8', 0], ['#E0A93A', 1]] :
+              [['#DDE2EC', 0], ['#C9D2E0', 1]]
+            })
+          Image(achBadgeOf(this.achToastMain().key))
+            .width(64)
+            .height(64)
+        }
+        .shadow(this.achToastHasLegend() ? { radius: 16, color: '#66B983FF', offsetX: 0, offsetY: 4 } :
+          (this.achToastHasGold() ? { radius: 14, color: '#55D4A017', offsetX: 0, offsetY: 4 } :
+          { radius: 8, color: '#1A000000', offsetX: 0, offsetY: 4 }))
+        // 徽章在卡片弹起后弹跳浮现（更弹的弹簧，阻尼比约 0.55）
+        .transition(TransitionEffect.asymmetric(
+          TransitionEffect.scale({ x: 0.3, y: 0.3 })
+            .combine(TransitionEffect.OPACITY)
+            .animation({ delay: 120, duration: 420, curve: curves.springCurve(0, 1, 210, 16) }),
+          TransitionEffect.IDENTITY
+        ))
+
+        Column({ space: 5 }) {
+          Text('恭喜解锁成就')
+            .fontSize(12)
+            .fontColor($r('app.color.text_hint'))
+          Text(this.achToastTitle())
+            .fontSize(19)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_main'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(this.achToastSubtitle())
+            .fontSize(13)
+            .fontColor($r('app.color.text_sub'))
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .textAlign(TextAlign.Center)
+            .lineHeight(19)
+        }
+        .alignItems(HorizontalAlign.Center)
+        // 文案紧随徽章上浮淡入
+        .transition(TransitionEffect.asymmetric(
+          TransitionEffect.translate({ y: 14 })
+            .combine(TransitionEffect.OPACITY)
+            .animation({ delay: 170, duration: 300, curve: Curve.FastOutSlowIn }),
+          TransitionEffect.IDENTITY
+        ))
+
+        Text(this.achToastDefs.length > 1 ? '查看全部成就' : '查看档案')
+          .fontSize(14)
+          .fontColor($r('app.color.accent'))
+          .padding({ left: 28, right: 28, top: 10, bottom: 10 })
+          .backgroundColor($r('app.color.chip_bg'))
+          .borderRadius(18)
+          .onClick(() => {
+            this.activeTab = 4;
+            // 多成就合并卡 → 成就墙；单成就「查看档案」→ 统计
+            this.mineSection = this.achToastDefs.length > 1 ? 1 : 0;
+            this.dismissAchToast();
+          })
+          // 主按钮在文案之后浮起
+          .transition(TransitionEffect.asymmetric(
+            TransitionEffect.translate({ y: 12 })
+              .combine(TransitionEffect.OPACITY)
+              .animation({ delay: 230, duration: 280, curve: Curve.FastOutSlowIn }),
+            TransitionEffect.IDENTITY
+          ))
+
+        Text('关闭')
+          .fontSize(14)
+          .fontColor($r('app.color.text_sub'))
+          .padding({ top: 2, bottom: 2 })
+          .onClick(() => {
+            this.dismissAchToast();
+          })
+          .transition(TransitionEffect.asymmetric(
+            TransitionEffect.translate({ y: 10 })
+              .combine(TransitionEffect.OPACITY)
+              .animation({ delay: 290, duration: 260, curve: Curve.FastOutSlowIn }),
+            TransitionEffect.IDENTITY
+          ))
+      }
+      .width('100%')
+      .padding({ top: 24, bottom: 16, left: 24, right: 24 })
+      .borderRadius(19)
+      .backgroundColor($r('app.color.card_bg'))
+      .alignItems(HorizontalAlign.Center)
+    }
+    .width(280)
+    .padding(1.5)
+    .borderRadius(21)
+    .linearGradient(this.achToastHasLegend() ? {
+      angle: 135,
+      colors: [['#FF6B6B', 0], ['#FFD93D', 0.25], ['#6BCB77', 0.5], ['#4D96FF', 0.75], ['#B983FF', 1]]
+    } : {
+      angle: 135,
+      colors: this.achToastHasGold() ? [['#FFE9A8', 0], ['#D4A017', 1]] :
+      [['#EDF0F6', 0], ['#C9D2E0', 1]]
+    })
+    .shadow(this.achToastHasLegend() ? { radius: 30, color: '#80B983FF', offsetX: 0, offsetY: 8 } :
+      (this.achToastHasGold() ? { radius: 24, color: '#66D4A017', offsetX: 0, offsetY: 6 } :
+      { radius: 20, color: '#26000000', offsetX: 0, offsetY: 8 }))
+    .onClick(() => {
+      this.dismissAchToast();
+    })
+    .transition(TransitionEffect.asymmetric(
+      // 入场：小尺寸弹起 + 上浮 + 淡入，弹簧曲线带轻微回弹（阻尼比约 0.73）
+      TransitionEffect.scale({ x: 0.5, y: 0.5 })
+        .combine(TransitionEffect.translate({ y: 30 }))
+        .combine(TransitionEffect.OPACITY)
+        .animation({ duration: 500, curve: curves.springCurve(0, 1, 170, 19) }),
+      // 收起：轻微缩小下沉 + 淡出，轻快不拖沓
+      TransitionEffect.scale({ x: 0.86, y: 0.86 })
+        .combine(TransitionEffect.translate({ y: 10 }))
+        .combine(TransitionEffect.OPACITY)
+        .animation({ duration: 200, curve: Curve.EaseOut })
+    ))
+  }
+
   @Builder
   settingsTab() {
     Column({ space: 14 }) {
@@ -3591,13 +4295,11 @@ struct Index {
       } else if (idx === 1) {
         this.paramsTab()
       } else if (idx === 2) {
-        this.styleTab()
+        this.layoutTab()
       } else if (idx === 3) {
-        this.frameTab()
-      } else if (idx === 4) {
         this.exportTab()
       } else {
-        this.settingsTab()
+        this.mineTab()
       }
     }
     .width('100%')
@@ -3626,10 +4328,8 @@ struct Index {
         this.tabBody(2)
       } else if (this.activeTab === 3) {
         this.tabBody(3)
-      } else if (this.activeTab === 4) {
-        this.tabBody(4)
       } else {
-        this.tabBody(5)
+        this.tabBody(4)
       }
     }
     .width('100%')
@@ -3647,7 +4347,7 @@ struct Index {
       this.panelScrollHVp = this.winHVp - gy;
     })
     // 导出页禁用底部渐变模糊：保存按钮是系统安全控件，祖先挂模糊效果会被静默拒绝授权
-    .linearGradientBlur(40, this.navBarHidden || this.activeTab === 4 ? undefined : this.panelBlurOptions())
+    .linearGradientBlur(40, this.navBarHidden || this.activeTab === 3 ? undefined : this.panelBlurOptions())
     .onAppear(() => {
       setTimeout(() => this.scheduleBarLumaCheck(true, wide), 300);
     })
@@ -3701,13 +4401,6 @@ struct Index {
         .height('100%')
       }
       .tabBar(this.floatTabItem(4))
-      TabContent() {
-        Column() {
-        }
-        .width('100%')
-        .height('100%')
-      }
-      .tabBar(this.floatTabItem(5))
     }
     .width(wide ? '100%' : this.portraitCapsuleW())
     // 容器高度必须=胶囊可视区（条高56+底距14），不能加 navBarH：下移入安全区由 translate 补偿，
@@ -3735,7 +4428,7 @@ struct Index {
         this.panelScroller.scrollEdge(Edge.Top);
         this.lastPanelScrollY = 0;
         this.setNavBarHidden(false);
-        if (i === 5) {
+        if (i === 4) {
           this.refreshCacheSize();
         }
         setTimeout(() => this.scheduleBarLumaCheck(true, false), 400);
@@ -4053,6 +4746,15 @@ struct Index {
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Center)
         .backgroundColor('#B3000000')
+      }
+
+      if (this.achToastShow) {
+        Stack({ alignContent: Alignment.Center }) {
+          this.achievementToastCard()
+        }
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
       }
     }
     .width('100%')

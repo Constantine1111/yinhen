@@ -51,6 +51,44 @@ export struct SegmentedControl {
   }
 }
 
+// 页签级分段（下划线式）：用于页面内容区块切换（如「排版｜边框」「统计｜成就墙｜设置」），
+// 与选项级的胶囊式 SegmentedControl 形成视觉层级区分
+@Component
+export struct SectionTabs {
+  items: SegmentItem[] = [];
+  @Prop selected: number = 0;
+  onPick: (v: number) => void = () => {
+  };
+
+  build() {
+    Row() {
+      ForEach(this.items, (item: SegmentItem) => {
+        Column({ space: 6 }) {
+          Text(item.label)
+            .fontSize(16)
+            .fontWeight(this.selected === item.value ? FontWeight.Bold : FontWeight.Medium)
+            .fontColor(this.selected === item.value ? $r('app.color.text_main') : $r('app.color.text_hint'))
+          // 下划线指示条：选中显示主题色短条，未选中保持占位防跳动
+          Row()
+            .width(28)
+            .height(3)
+            .borderRadius(2)
+            .backgroundColor(this.selected === item.value ? $r('app.color.accent') : Color.Transparent)
+            .animation({ duration: 200, curve: Curve.EaseOut })
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .padding({ top: 2, bottom: 8 })
+        .onClick(() => {
+          this.onPick(item.value);
+        })
+      }, (item: SegmentItem) => `${item.label}-${item.value}`)
+    }
+    .width('100%')
+    .border({ width: { bottom: 1 }, color: $r('app.color.border_preset') })
+  }
+}
+
 @Component
 export struct LabeledSlider {
   label: string = '';

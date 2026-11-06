@@ -481,6 +481,8 @@ export const FRAME_COLORS: string[] = [
 ];
 
 export class StylePreset {
+  // 唯一标识：内置样式 bi-<名称>，个人样式 cs-<时间戳>
+  id: string = '';
   name: string = '';
   frameMode: number = 1;
   layoutKind: number = 0;
@@ -502,6 +504,10 @@ export class StylePreset {
   desc: string = '';
   refFile: string = '';
   refAspect: number = 1.4;
+  // 个人样式标记：refFile 为缩略图绝对路径
+  custom: boolean = false;
+  favorite: boolean = false;
+  createdAt: number = 0;
 }
 
 function preset(name: string, frameMode: number, layoutKind: number, directPos: number,
@@ -563,8 +569,130 @@ export function buildPresets(): StylePreset[] {
     arr[i].desc = descs[i];
     arr[i].refFile = refFiles[i];
     arr[i].refAspect = refAspects[i];
+    arr[i].id = `bi-${arr[i].name}`;
   }
   return arr;
+}
+
+function rawNum(o: Record<string, Object>, key: string, def: number): number {
+  const v: Object | undefined = o[key];
+  return typeof v === 'number' ? v : def;
+}
+
+function rawStr(o: Record<string, Object>, key: string, def: string): string {
+  const v: Object | undefined = o[key];
+  return typeof v === 'string' ? v : def;
+}
+
+function rawBool(o: Record<string, Object>, key: string, def: boolean): boolean {
+  const v: Object | undefined = o[key];
+  return typeof v === 'boolean' ? v : def;
+}
+
+// 个人样式序列化为可写入 preferences 的 JSON 数组（refFile 存相对文件名）
+export function savedStylesToRaw(list: StylePreset[]): string {
+  const arr: Record<string, Object>[] = [];
+  for (const p of list) {
+    const r: Record<string, Object> = {
+      'id': p.id,
+      'name': p.name,
+      'frameMode': p.frameMode,
+      'layoutKind': p.layoutKind,
+      'directPos': p.directPos,
+      'frameColor': p.frameColor,
+      'textColor': p.textColor,
+      'keylineOn': p.keylineOn,
+      'keylineColor': p.keylineColor,
+      'barLayout': p.barLayout,
+      'alignMode': p.alignMode,
+      'frameMarginPct': p.frameMarginPct,
+      'sizeScalePct': p.sizeScalePct,
+      'blurPct': p.blurPct,
+      'showMask': p.showMask,
+      'shadowMode': p.shadowMode,
+      'filmStyle': p.filmStyle,
+      'parTags': p.parTags,
+      'thumb': p.refFile,
+      'refAspect': p.refAspect,
+      'favorite': p.favorite,
+      'createdAt': p.createdAt,
+      'desc': p.desc
+    };
+    arr.push(r);
+  }
+  return JSON.stringify(arr);
+}
+
+// 解析持久化的个人样式；thumbDir 为缩略图目录，文件缺失的条目跳过
+export function parseSavedStyles(raw: string, thumbDir: string): StylePreset[] {
+  const out: StylePreset[] = [];
+  if (raw === '' || raw === '[]') {
+    return out;
+  }
+  try {
+    const arr: Object[] = JSON.parse(raw) as Object[];
+    for (const item of arr) {
+      const o: Record<string, Object> = item as Record<string, Object>;
+      const p: StylePreset = new StylePreset();
+      p.id = rawStr(o, 'id', '');
+      p.name = rawStr(o, 'name', '我的样式');
+      p.frameMode = rawNum(o, 'frameMode', 1);
+      p.layoutKind = rawNum(o, 'layoutKind', 0);
+      p.directPos = rawNum(o, 'directPos', 0);
+      p.frameColor = rawStr(o, 'frameColor', '#FFFFFF');
+      p.textColor = rawStr(o, 'textColor', '#222222');
+      p.keylineOn = rawBool(o, 'keylineOn', false);
+      p.keylineColor = rawStr(o, 'keylineColor', '#222222');
+      p.barLayout = rawNum(o, 'barLayout', 0);
+      p.alignMode = rawNum(o, 'alignMode', 1);
+      p.frameMarginPct = rawNum(o, 'frameMarginPct', 6);
+      p.sizeScalePct = rawNum(o, 'sizeScalePct', 100);
+      p.blurPct = rawNum(o, 'blurPct', 12);
+      p.showMask = rawNum(o, 'showMask', 238);
+      p.shadowMode = rawNum(o, 'shadowMode', 1);
+      p.filmStyle = rawBool(o, 'filmStyle', false);
+      p.parTags = rawBool(o, 'parTags', false);
+      p.desc = rawStr(o, 'desc', '');
+      p.refAspect = rawNum(o, 'refAspect', 1.4);
+      p.favorite = rawBool(o, 'favorite', false);
+      p.createdAt = rawNum(o, 'createdAt', 0);
+      const thumb: string = rawStr(o, 'thumb', '');
+      if (p.id !== '' && thumb !== '') {
+        p.refFile = `${thumbDir}/${thumb}`;
+        p.custom = true;
+        out.push(p);
+      }
+    }
+  } catch (err) {
+    // 解析失败按无个人样式处理，不影响内置样式
+  }
+  return out;
+}
+
+// 内置样式收藏名单序列化 / 恢复
+export function builtinFavsToRaw(list: StylePreset[]): string {
+  const ids: string[] = [];
+  for (const p of list) {
+    if (p.favorite) {
+      ids.push(p.id);
+    }
+  }
+  return JSON.stringify(ids);
+}
+
+export function applyBuiltinFavs(list: StylePreset[], raw: string): void {
+  if (raw === '' || raw === '[]') {
+    return;
+  }
+  let ids: string[] = [];
+  try {
+    ids = JSON.parse(raw) as string[];
+  } catch (err) {
+    return;
+  }
+  for (const p of list) {
+    p.favorite = ids.indexOf(p.id) >= 0;
+  }
 }
 
 export const KEYLINE_COLORS: string[] = [
@@ -594,14 +722,17 @@ export class BrandLogo {
 
 export const BRAND_LOGOS: BrandLogo[] = [
   new BrandLogo('canon', '佳能', 'logos/canon-b.svg', 'logos/canon-w.svg', 4.75),
-  new BrandLogo('nikon', '尼康', 'logos/nikon-b.svg', 'logos/nikon-w.svg', 3.61),
+  new BrandLogo('nikon', '尼康-文字', 'logos/nikon-b.svg', 'logos/nikon-w.svg', 3.61),
+  new BrandLogo('nikon-icon', '尼康-图标', 'logos/nikon-i.png', 'logos/nikon-i.png', 1.0),
   new BrandLogo('sony', '索尼', 'logos/sony-b.svg', 'logos/sony-w.svg', 5.68),
   new BrandLogo('fujifilm', '富士', 'logos/fujifilm-b.svg', 'logos/fujifilm-w.svg', 5.99),
-  new BrandLogo('leica', '徕卡', 'logos/leica-b.svg', 'logos/leica-w.svg', 2.25),
+  new BrandLogo('leica', '徕卡-文字', 'logos/leica-b.svg', 'logos/leica-w.svg', 2.25),
+  new BrandLogo('leica-icon', '徕卡-图标', 'logos/leica-i.png', 'logos/leica-i.png', 1.0),
   new BrandLogo('hasselblad', '哈苏', 'logos/hasselblad-h-b.png', 'logos/hasselblad-h-w.png', 1.35),
   new BrandLogo('pentax', '宾得', 'logos/pentax-b.svg', 'logos/pentax-w.svg', 5.15),
-  new BrandLogo('ricoh', '理光', 'logos/ricoh-b.svg', 'logos/ricoh-w.svg', 5.61),
+  new BrandLogo('ricoh', '理光', 'logos/ricoh-b.png', 'logos/ricoh-w.png', 5.61),
   new BrandLogo('olympus', '奥林巴斯', 'logos/olympus-b.svg', 'logos/olympus-w.svg', 8.02),
+  new BrandLogo('omsystem', 'OM System', 'logos/omsystem-b.png', 'logos/omsystem-w.png', 8.09),
   new BrandLogo('panasonic', '松下', 'logos/panasonic-b.svg', 'logos/panasonic-w.svg', 5.08),
   new BrandLogo('sigma', '适马', 'logos/sigma-b.svg', 'logos/sigma-w.svg', 4.62),
   new BrandLogo('dji', '大疆', 'logos/dji-b.svg', 'logos/dji-w.svg', 1.70),
@@ -645,8 +776,11 @@ export function detectBrand(make: string, model: string): string {
   if (s.includes('HASSELBLAD')) {
     return 'hasselblad';
   }
-  if (s.includes('OLYMPUS') || s.includes('OM DIGITAL') || s.includes('OM SYSTEM') || s.includes('OM-')) {
+  if (s.includes('OLYMPUS') || s.includes('OM-D')) {
     return 'olympus';
+  }
+  if (s.includes('OM DIGITAL') || s.includes('OM SYSTEM') || s.includes('OM-')) {
+    return 'omsystem';
   }
   if (s.includes('PANASONIC') || s.includes('LUMIX')) {
     return 'panasonic';

@@ -45,7 +45,11 @@ import {
   detectBrand,
   brandByKey,
   cleanModelText,
-  cleanMakeText
+  cleanMakeText,
+  savedStylesToRaw,
+  parseSavedStyles,
+  builtinFavsToRaw,
+  applyBuiltinFavs
 } from '../model/WatermarkModels';
 import {
   SegmentItem,
@@ -341,6 +345,17 @@ struct Index {
   };
   private hoverVerifyTimer: number = -1;
   private presets: StylePreset[] = buildPresets();
+  // 个人样式与收藏：styleList 为展示序列（收藏置顶），savedStyles 仅个人样式
+  @State styleList: StylePreset[] = [];
+  @State favIds: string[] = [];
+  private savedStyles: StylePreset[] = [];
+  private styleDir: string = '';
+  // 收藏红心动画：heartAnimId 命中当前播放的卡片，fill 0→1 为填充进度
+  @State heartAnimId: string = '';
+  @State heartFill: number = 0;
+  @State heartPop: number = 1;
+  @State heartAlpha: number = 0;
+  private lastLongPressAt: number = 0;
   private tabItems: SegmentItem[] = [
     new SegmentItem('样式', 0),
     new SegmentItem('参数', 1),
@@ -485,9 +500,27 @@ struct Index {
   private async loadSettings(): Promise<void> {
     const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
     this.logoDir = `${context.filesDir}/logo`;
+    this.styleDir = `${context.filesDir}/styles`;
+    try {
+      if (!fileIo.accessSync(this.styleDir)) {
+        fileIo.mkdirSync(this.styleDir);
+      }
+    } catch (err) {
+      Logger.error(`WMSTYLE styles dir init failed: ${JSON.stringify(err)}`);
+    }
+    this.rebuildStyleList();
     try {
       const p: preferences.Preferences = await preferences.getPreferences(context, 'app_settings');
       this.skinMode = p.getSync('skinMode', -1) as number;
+      // 恢复个人样式（校验缩略图仍存在）与内置样式收藏
+      this.savedStyles = parseSavedStyles(p.getSync('savedStyles', '[]') as string, this.styleDir);
+      for (let i = this.savedStyles.length - 1; i >= 0; i--) {
+        if (!fileIo.accessSync(this.savedStyles[i].refFile)) {
+          this.savedStyles.splice(i, 1);
+        }
+      }
+      applyBuiltinFavs(this.presets, p.getSync('builtinFavs', '[]') as string);
+      this.rebuildStyleList();
       // 恢复个人 Logo（校验文件仍存在）
       const pa: number = p.getSync('personalAspect', 0) as number;
       if (pa > 0 && this.logoDir !== '') {
@@ -1697,7 +1730,7 @@ struct Index {
   }
 
   private applyPreset(p: StylePreset): void {
-    this.activePreset = p.name;
+    this.activePreset = p.id;
     this.frameMode = p.frameMode;
     this.layoutKind = p.layoutKind;
     this.directPos = p.directPos;
@@ -1718,6 +1751,274 @@ struct Index {
       this.refreshBlurredBg();
     }
     this.refreshLayouts();
+  }
+
+  // ===== 个人样式与收藏 =====
+
+  // 展示序列：收藏置顶（个人样式按保存时间倒序，随后内置样式原顺序）
+  private rebuildStyleList(): void {
+    const favs: StylePreset[] = [];
+    const rest: StylePreset[] = [];
+    const customs: StylePreset[] = this.savedStyles.slice();
+    customs.sort((a: StylePreset, b: StylePreset) => b.createdAt - a.createdAt);
+    for (const p of customs) {
+      if (p.favorite) {
+        favs.push(p);
+      } else {
+        rest.push(p);
+      }
+    }
+    for (const p of this.presets) {
+      if (p.favorite) {
+        favs.push(p);
+      } else {
+        rest.push(p);
+      }
+    }
+    this.styleList = favs.concat(rest);
+    const ids: string[] = [];
+    for (const p of favs) {
+      ids.push(p.id);
+    }
+    this.favIds = ids;
+  }
+
+  private async persistSavedStyles(): Promise<void> {
+    try {
+      const context: common.UIAbilityContext =
+        this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const p: preferences.Preferences = await preferences.getPreferences(context, 'app_settings');
+      await p.put('savedStyles', savedStylesToRaw(this.savedStyles));
+      await p.flush();
+    } catch (err) {
+      Logger.error(`WMSTYLE persist saved styles failed: ${JSON.stringify(err)}`);
+    }
+  }
+
+  private async persistBuiltinFavs(): Promise<void> {
+    try {
+      const context: common.UIAbilityContext =
+        this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const p: preferences.Preferences = await preferences.getPreferences(context, 'app_settings');
+      await p.put('builtinFavs', builtinFavsToRaw(this.presets));
+      await p.flush();
+    } catch (err) {
+      Logger.error(`WMSTYLE persist builtin favs failed: ${JSON.stringify(err)}`);
+    }
+  }
+
+  private styleDateStr(ts: number): string {
+    const d: Date = new Date(ts);
+    const m: number = d.getMonth() + 1;
+    const day: number = d.getDate();
+    const mm: string = m < 10 ? `0${m}` : `${m}`;
+    const dd: string = day < 10 ? `0${day}` : `${day}`;
+    return `${d.getFullYear()}-${mm}-${dd}`;
+  }
+
+  private nextStyleName(): string {
+    let n: number = this.savedStyles.length + 1;
+    while (n < 1000) {
+      const name: string = `我的样式 ${n}`;
+      let used: boolean = false;
+      for (const p of this.savedStyles) {
+        if (p.name === name) {
+          used = true;
+          break;
+        }
+      }
+      if (!used) {
+        return name;
+      }
+      n++;
+    }
+    return `我的样式 ${Date.now()}`;
+  }
+
+  // 把当前样式（含预览缩略图）保存为个人样式
+  private async saveCurrentStyle(): Promise<void> {
+    if (this.pixelMap === undefined) {
+      this.toast('请先选择一张图片，再保存样式');
+      return;
+    }
+    if (this.styleDir === '') {
+      this.toast('样式保存失败，请重试');
+      return;
+    }
+    await this.ensureDecoded();
+    const lay: FrameLayout = this.layoutPx();
+    if (lay.outW <= 0 || lay.outH <= 0) {
+      this.toast('样式保存失败，请重试');
+      return;
+    }
+    this.canvasC = scaleLayout(lay, 1 / this.density);
+    let pm: image.PixelMap | undefined = undefined;
+    try {
+      pm = await this.getUIContext().getComponentSnapshot().createFromBuilder(
+        (): void => {
+          this.watermarkCanvas();
+        },
+        300,
+        true,
+        { scale: Math.min(0.5, 520 / lay.outW), waitUntilRenderFinished: true }
+      );
+    } catch (err) {
+      Logger.error(`WMSTYLE snapshot failed: ${JSON.stringify(err)}`);
+      pm = undefined;
+    }
+    this.refreshLayouts();
+    if (pm === undefined) {
+      this.toast('样式保存失败，请重试');
+      return;
+    }
+    const id: string = `cs-${Date.now()}`;
+    const thumbPath: string = `${this.styleDir}/style-${id}.jpg`;
+    let aspect: number = 1.4;
+    try {
+      const info: image.ImageInfo = await pm.getImageInfo();
+      if (info.size.width > 0 && info.size.height > 0) {
+        aspect = info.size.width / info.size.height;
+      }
+    } catch (err) {
+      Logger.error(`WMSTYLE thumb info failed: ${JSON.stringify(err)}`);
+    }
+    const saved: boolean = await ImageTools.saveJpegFile(pm, thumbPath, 82);
+    pm.release();
+    if (!saved) {
+      this.toast('样式保存失败，请重试');
+      return;
+    }
+    const p: StylePreset = new StylePreset();
+    p.id = id;
+    p.name = this.nextStyleName();
+    p.custom = true;
+    p.createdAt = Date.now();
+    p.frameMode = this.frameMode;
+    p.layoutKind = this.layoutKind;
+    p.directPos = this.directPos;
+    p.frameColor = this.frameColor;
+    p.textColor = this.textColor;
+    p.keylineOn = this.keylineOn;
+    p.keylineColor = this.keylineColor;
+    p.barLayout = this.barLayout;
+    p.alignMode = this.alignMode;
+    p.frameMarginPct = this.frameMarginPct;
+    p.sizeScalePct = this.sizeScalePct;
+    p.blurPct = this.blurPct;
+    p.showMask = this.showMask;
+    p.shadowMode = this.shadowMode;
+    p.filmStyle = this.filmStyle;
+    p.parTags = this.parTags;
+    p.refFile = thumbPath;
+    p.refAspect = aspect;
+    p.desc = `${this.styleDateStr(p.createdAt)} 保存`;
+    this.savedStyles.push(p);
+    await this.persistSavedStyles();
+    this.rebuildStyleList();
+    this.activePreset = p.id;
+    this.toast(`已保存「${p.name}」，长按卡片可收藏`);
+  }
+
+  private confirmDeleteStyle(p: StylePreset): void {
+    this.getUIContext().showAlertDialog({
+      title: '删除样式',
+      message: `确定删除「${p.name}」吗？`,
+      alignment: DialogAlignment.Bottom,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '删除',
+        action: () => {
+          this.deleteStyle(p);
+        }
+      }
+    });
+  }
+
+  private async deleteStyle(p: StylePreset): Promise<void> {
+    const idx: number = this.savedStyles.indexOf(p);
+    if (idx < 0) {
+      return;
+    }
+    this.savedStyles.splice(idx, 1);
+    try {
+      if (fileIo.accessSync(p.refFile)) {
+        fileIo.unlinkSync(p.refFile);
+      }
+    } catch (err) {
+      Logger.error(`WMSTYLE thumb unlink failed: ${JSON.stringify(err)}`);
+    }
+    if (this.activePreset === p.id) {
+      this.activePreset = '';
+    }
+    await this.persistSavedStyles();
+    this.rebuildStyleList();
+    this.toast('样式已删除');
+  }
+
+  // 长按收藏 / 取消收藏：红心由底部慢慢填满（取消时反向退去），完成后置顶排序
+  private onCardLongPress(p: StylePreset): void {
+    if (this.heartAnimId !== '') {
+      return;
+    }
+    this.lastLongPressAt = Date.now();
+    const fav: boolean = !p.favorite;
+    this.heartAnimId = p.id;
+    if (fav) {
+      this.heartFill = 0;
+      this.heartPop = 0.4;
+      this.heartAlpha = 1;
+      this.getUIContext().animateTo({ duration: 500, curve: Curve.EaseInOut }, () => {
+        this.heartFill = 1;
+        this.heartPop = 1.18;
+      });
+      setTimeout(() => {
+        this.getUIContext().animateTo({ duration: 160, curve: Curve.EaseOut }, () => {
+          this.heartPop = 1;
+        });
+      }, 510);
+      setTimeout(() => {
+        this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
+          this.heartAlpha = 0;
+        });
+      }, 690);
+      setTimeout(() => {
+        this.commitFavorite(p, true);
+      }, 900);
+    } else {
+      this.heartFill = 1;
+      this.heartPop = 1;
+      this.heartAlpha = 1;
+      this.getUIContext().animateTo({ duration: 380, curve: Curve.EaseInOut }, () => {
+        this.heartFill = 0;
+      });
+      setTimeout(() => {
+        this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseOut }, () => {
+          this.heartAlpha = 0;
+        });
+      }, 400);
+      setTimeout(() => {
+        this.commitFavorite(p, false);
+      }, 600);
+    }
+  }
+
+  private commitFavorite(p: StylePreset, fav: boolean): void {
+    p.favorite = fav;
+    this.heartAnimId = '';
+    this.heartFill = 0;
+    this.heartPop = 1;
+    this.heartAlpha = 0;
+    if (p.custom) {
+      this.persistSavedStyles();
+    } else {
+      this.persistBuiltinFavs();
+    }
+    this.rebuildStyleList();
+    this.toast(fav ? '已收藏，将置顶显示' : '已取消收藏');
   }
 
   private isDarkColor(c: string): boolean {
@@ -2849,12 +3150,68 @@ struct Index {
   @Builder
   presetCard(p: StylePreset) {
     Column({ space: 6 }) {
-      Image($rawfile(p.refFile))
+      Stack({ alignContent: Alignment.Center }) {
+        Stack({ alignContent: Alignment.TopEnd }) {
+          if (p.custom) {
+            Image(`file://${p.refFile}`)
+              .width('100%')
+              .aspectRatio(p.refAspect)
+              .objectFit(ImageFit.Cover)
+              .borderRadius(6)
+              .border({ width: 1, color: $r('app.color.ref_border') })
+          } else {
+            Image($rawfile(p.refFile))
+              .width('100%')
+              .aspectRatio(p.refAspect)
+              .objectFit(ImageFit.Cover)
+              .borderRadius(6)
+              .border({ width: 1, color: $r('app.color.ref_border') })
+          }
+          if (this.favIds.includes(p.id)) {
+            Image($r('app.media.heart_red'))
+              .width(16)
+              .height(16)
+              .margin(6)
+          }
+          if (p.custom) {
+            Text('✕')
+              .fontSize(11)
+              .fontColor('#FFFFFF')
+              .fontWeight(FontWeight.Medium)
+              .width(20)
+              .height(20)
+              .textAlign(TextAlign.Center)
+              .borderRadius(10)
+              .backgroundColor('#99000000')
+              .position({ x: 5, y: 5 })
+              .onClick(() => {
+                this.confirmDeleteStyle(p);
+              })
+          }
+        }
         .width('100%')
-        .aspectRatio(p.refAspect)
-        .objectFit(ImageFit.Cover)
-        .borderRadius(6)
-        .border({ width: 1, color: $r('app.color.ref_border') })
+
+        if (this.heartAnimId === p.id) {
+          Stack({ alignContent: Alignment.Bottom }) {
+            Image($r('app.media.heart_outline'))
+              .width(44)
+              .height(44)
+            Stack({ alignContent: Alignment.Bottom }) {
+              Image($r('app.media.heart_red'))
+                .width(44)
+                .height(44)
+            }
+            .width(44)
+            .height(44 * this.heartFill)
+            .clip(true)
+          }
+          .width(44)
+          .height(44)
+          .scale({ x: this.heartPop, y: this.heartPop })
+          .opacity(this.heartAlpha)
+        }
+      }
+      .width('100%')
 
       Blank()
 
@@ -2862,7 +3219,7 @@ struct Index {
         Text(p.name)
           .fontSize(12)
           .fontColor($r('app.color.text_main'))
-          .fontWeight(this.activePreset === p.name ? FontWeight.Medium : FontWeight.Normal)
+          .fontWeight(this.activePreset === p.id ? FontWeight.Medium : FontWeight.Normal)
           .width('100%')
           .textAlign(TextAlign.Center)
           .maxLines(1)
@@ -2881,11 +3238,20 @@ struct Index {
     .padding(8)
     .borderRadius(10)
     .backgroundColor($r('app.color.card_bg'))
-    .border({ width: this.activePreset === p.name ? 1.5 : 1, color: this.activePreset === p.name ? $r('app.color.accent') : $r('app.color.border_preset') })
+    .border({ width: this.activePreset === p.id ? 1.5 : 1, color: this.activePreset === p.id ? $r('app.color.accent') : $r('app.color.border_preset') })
     .height(this.presetCardH(p))
     .onClick(() => {
+      if (Date.now() - this.lastLongPressAt < 700) {
+        return;
+      }
       this.applyPreset(p);
     })
+    .gesture(
+      LongPressGesture({ duration: 400 })
+        .onAction(() => {
+          this.onCardLongPress(p);
+        })
+    )
   }
 
   private presetCardW(): number {
@@ -2909,33 +3275,45 @@ struct Index {
     if (this.presetSingleCol) {
       return selfH;
     }
-    const i: number = this.presets.indexOf(p);
+    const i: number = this.styleList.indexOf(p);
     if (i < 0) {
       return selfH;
     }
     const mateIdx: number = i % 2 === 0 ? i + 1 : i - 1;
-    if (mateIdx < 0 || mateIdx >= this.presets.length) {
+    if (mateIdx < 0 || mateIdx >= this.styleList.length) {
       return selfH;
     }
-    const mateH: number = headroom + this.presetImageH(this.presets[mateIdx]);
+    const mateH: number = headroom + this.presetImageH(this.styleList[mateIdx]);
     return Math.max(selfH, mateH);
   }
 
   @Builder
   presetsTab() {
     Column({ space: 10 }) {
-      Text('选择一套样式，之后可在其他页签微调')
+      Text('选择一套样式，之后可在其他页签微调 · 长按卡片收藏置顶')
         .fontSize(12)
         .fontColor($r('app.color.text_hint'))
         .width('100%')
         .textAlign(TextAlign.Center)
 
+      Text('＋ 保存当前样式为个人样式')
+        .fontSize(13)
+        .fontColor($r('app.color.text_sub'))
+        .border({ width: 1.2, color: $r('app.color.border_soft') })
+        .borderRadius(10)
+        .height(40)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .onClick(() => {
+          this.saveCurrentStyle();
+        })
+
       Grid() {
-        ForEach(this.presets, (p: StylePreset) => {
+        ForEach(this.styleList, (p: StylePreset) => {
           GridItem() {
             this.presetCard(p)
           }
-        }, (p: StylePreset) => p.name)
+        }, (p: StylePreset) => p.id)
       }
       .columnsTemplate(this.presetSingleCol ? '1fr' : '1fr 1fr')
       .columnsGap(10)

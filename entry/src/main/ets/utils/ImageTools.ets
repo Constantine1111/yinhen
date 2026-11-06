@@ -1095,6 +1095,29 @@ export class ImageTools {
     }
   }
 
+  // 将 PixelMap 压缩为 JPEG 写入应用沙箱指定路径（个人样式缩略图等）
+  static async saveJpegFile(pm: image.PixelMap, path: string, quality: number): Promise<boolean> {
+    let f: fileIo.File | undefined = undefined;
+    let packer: image.ImagePacker | undefined = undefined;
+    try {
+      packer = image.createImagePacker();
+      const data: ArrayBuffer = await packer.packToData(pm, { format: 'image/jpeg', quality: quality });
+      f = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+      fileIo.writeSync(f.fd, data);
+      return true;
+    } catch (err) {
+      Logger.error(`WMSTYLE save thumb failed path=${path} err=${JSON.stringify(err)}`);
+      return false;
+    } finally {
+      if (packer !== undefined) {
+        packer.release();
+      }
+      if (f !== undefined) {
+        fileIo.closeSync(f);
+      }
+    }
+  }
+
   private static async saveLogoPng(buf: ArrayBuffer, w: number, h: number, path: string): Promise<boolean> {
     let f: fileIo.File | undefined = undefined;
     let pm: image.PixelMap | undefined = undefined;
